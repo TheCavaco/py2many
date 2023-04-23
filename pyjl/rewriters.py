@@ -540,6 +540,7 @@ class JuliaIndexingRewriter(ast.NodeTransformer):
         super().__init__()
         self._curr_slice_val = None
         self._valid_loop_vars = set()
+        self._valid_comprehension_vars = set()
 
     def visit_Module(self, node: ast.Module) -> Any:
         imports = getattr(node, "imports", [])
@@ -567,6 +568,34 @@ class JuliaIndexingRewriter(ast.NodeTransformer):
                 self._valid_loop_vars.add(get_id(node.target))
         self.generic_visit(node)
         self._valid_loop_vars.difference_update(targets)
+        return node
+
+    def visit_ListComp(self, node: ast.ListComp) -> Any:
+        targets = set()
+        
+        # Check each generator
+        for generator in node.generators:
+            gen_targets = set()
+            positive_and_ascending_range = isinstance(generator.iter, ast.Call) and  \
+                get_id(generator.iter.func) == "range" and \
+                ((len(generator.iter.args) < 3 and isinstance(generator.iter.args[0], ast.Constant)) or 
+                (len(generator.iter.args) == 3 and isinstance(generator.iter.args[0], ast.Constant) and
+                    isinstance(generator.iter.args[2], ast.Constant)))
+            
+            if positive_and_ascending_range:
+                if isinstance(generator, ast.comprehension) and\
+                      isinstance(generator.target, ast.Name) and\
+                          isinstance(node.elt, ast.Subscript) and\
+                              isinstance(node.elt.slice, ast.Name) and\
+                                get_id(generator.target) == get_id(node.elt.slice):
+                    print("first")
+                    
+                    gen_targets = {get_id(generator.target)}
+                    # TODO: test this update
+                    targets.update(gen_targets)
+                    self._valid_comprehension_vars.add(get_id(generator.target))
+        self.generic_visit(node)
+        self._valid_comprehension_vars.difference_update(targets)
         return node
 
     def visit_Subscript(self, node: ast.Subscript) -> Any:
@@ -632,6 +661,7 @@ class JuliaIndexingRewriter(ast.NodeTransformer):
                 not isinstance(node.slice, ast.Slice):
             call_id = None
             if isinstance(node.slice, ast.Call):
+                # TODO: handle simple calls
                 call_id = self._get_assign_value(node.slice)
 
             if not getattr(node, "range_optimization", None) and \
@@ -653,9 +683,16 @@ class JuliaIndexingRewriter(ast.NodeTransformer):
                     if isinstance(node.slice, ast.Constant) and \
                             isinstance(node.slice.value, str):
                         return node
+                    
+                    if get_id(node.slice) != "end" and \
+                        isinstance(node.slice, ast.Name) and\
+                              get_id(node.slice) in self._valid_comprehension_vars:
+                        # No need to add
+                        print("second")
 
-                    # Default: add 1
-                    if get_id(node.slice) != "end":
+                        return node
+                    elif get_id(node.slice) != "end":
+                        # Default: add 1
                         node.slice = self._do_bin_op(node.slice, ast.Add(), 1,
                             node.lineno, node.col_offset)
             elif getattr(node, "range_optimization", None) and \
@@ -682,6 +719,16 @@ class JuliaIndexingRewriter(ast.NodeTransformer):
                         node.slice = self._do_bin_op(node.slice, ast.Sub(), dec,
                             node.lineno, node.col_offset)
 
+        return node
+    
+    def visit_comprehension(self, node: ast.comprehension) -> Any:
+        self.generic_visit(node)
+        comp_var = get_id(node.target) in self._valid_comprehension_vars and isinstance(node.iter, ast.Call)
+        rest = (get_id(node.iter.func) == "range" or get_id(node.iter.func) == "xrange") and\
+        (not getattr(node, "range_optimization", None) or \
+                    getattr(node, "using_offset_arrays", None))
+        
+        # remove the - 1
         return node
 
     def _bin_op_contains(self, bin_op: ast.BinOp, node_id):
@@ -791,6 +838,7 @@ class JuliaIndexingRewriter(ast.NodeTransformer):
                         value=1, 
                         scopes=getattr(node.args[0], "scopes", ScopeList()))
                 elif len(node.args) > 1:
+
                     # increment start
                     node.args[0] = self._do_bin_op(node.args[0], ast.Add(), 1,
                         node.lineno, node.col_offset)
